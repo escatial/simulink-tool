@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.tsbuildinfo
+
+# Runtime data
+storage/
+backend/storage/
+*.db
+*.sqlite
+
+# Environment and secrets
+.env
+*.local
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+.npm-cache/
+.chrome-profile/
+chrome-dom.txt
+chrome-page.png
+frontend-vite*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
