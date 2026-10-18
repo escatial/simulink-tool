@@ -1,34 +1,34 @@
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { graphlib, layout as dagreLayout } from "@dagrejs/dagre";
 import { Background, Controls, Handle, MarkerType, Position, ReactFlow, type Edge, type Node, type NodeProps } from "@xyflow/react";
-import { api, Document, Job, Model, ModelSummary, Project } from "./api";
+import { api, Artifact, Document, Job, Model, ModelSummary, Project, SourceBlock } from "./api";
 
-const statusLabel: Record<string, string> = {
-  queued: "排队中",
-  running: "处理中",
-  completed: "已完成",
-  failed: "失败",
-  draft: "待确认",
-  confirmed: "已确认",
-  "可直接搭建": "可直接搭建",
-  "补充参数后可搭建": "补充参数后可搭建",
-  "结构存在歧义": "结构存在歧义",
-  "仅供参考": "仅供参考",
-};
-
+type View = "overview" | "source" | "model" | "validation" | "export";
+type Snapshot = Model["model"];
+type ModuleItem = Snapshot["modules"][number];
+type ParameterItem = Snapshot["parameters"][number];
 type BlockNodeData = { id: string; name: string; kind: string; description: string };
-type BlockNodeType = Node<BlockNodeData, "simulinkBlock">;
 
-function SimulinkBlock({ data }: NodeProps<BlockNodeType>) {
-  return <div className="simulink-node">
-    <Handle type="target" position={Position.Left} />
-    <div className="simulink-node-meta"><span>{data.id}</span><span>{data.kind}</span></div>
-    <strong>{data.name}</strong>
-    <small>{data.description || "Simulink 模块"}</small>
-    <Handle type="source" position={Position.Right} />
-  </div>;
+const viewItems: Array<{ id: View; label: string; detail: string }> = [
+  { id: "overview", label: "项目概览", detail: "文档与版本" },
+  { id: "source", label: "需求证据", detail: "原文与定位" },
+  { id: "model", label: "模型方案", detail: "结构与参数" },
+  { id: "validation", label: "校验问题", detail: "风险与假设" },
+  { id: "export", label: "导出方案", detail: "交付文件" },
+];
+
+const domainOptions = [["motor_control", "电机控制"], ["temperature_control", "温度控制"], ["level_control", "液位控制"], ["mechanical", "机械系统"], ["generic_control", "通用控制"], ["unknown", "待识别"]];
+const parameterStatuses = [["confirmed_from_document", "文档已确认"], ["inferred", "系统推断"], ["needs_confirmation", "待确认"], ["missing", "缺失"], ["unit_unknown", "单位未知"], ["multiple_candidates", "多个候选"]];
+const statusLabel: Record<string, string> = { queued: "排队中", running: "处理中", completed: "已完成", failed: "失败", parsing: "解析中", uploaded: "待解析", draft: "草稿", confirmed: "已确认", "可直接搭建": "可直接搭建", "补充参数后可搭建": "补充参数后可搭建", "结构存在歧义": "结构有歧义", "仅供参考": "仅供参考" };
+
+function labelFor(map: string[][], value: string | undefined) { return map.find(([key]) => key === value)?.[1] || value || "未设置"; }
+function cloneSnapshot(snapshot: Snapshot): Snapshot { return JSON.parse(JSON.stringify(snapshot)) as Snapshot; }
+function formatBytes(size: number) { if (size < 1024) return `${size} B`; if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`; return `${(size / 1024 / 1024).toFixed(1)} MB`; }
+function formatLocator(locator: Record<string, unknown>) { if (locator.page_number) return `第 ${locator.page_number} 页`; if (locator.line_start) return `第 ${locator.line_start}-${locator.line_end || locator.line_start} 行`; if (locator.section_path) return String((locator.section_path as string[]).join(" / ")); return "原文位置未标注"; }
+
+function SimulinkBlock({ data }: NodeProps<Node<BlockNodeData, "simulinkBlock">>) {
+  return <div className="simulink-node"><Handle type="target" position={Position.Left} /><div className="simulink-node-meta"><span>{data.id}</span><span>{data.kind}</span></div><strong>{data.name}</strong><small>{data.description || "未填写模块说明"}</small><Handle type="source" position={Position.Right} /></div>;
 }
-
 const graphNodeTypes = { simulinkBlock: SimulinkBlock };
 
 function App() {
@@ -37,245 +37,69 @@ function App() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
+  const [draft, setDraft] = useState<Snapshot | null>(null);
+  const [blocks, setBlocks] = useState<SourceBlock[]>([]);
+  const [selectedBlockId, setSelectedBlockId] = useState("");
   const [job, setJob] = useState<Job | null>(null);
+  const [view, setView] = useState<View>("overview");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [projectForm, setProjectForm] = useState({ name: "", description: "" });
-
   const selectedProject = useMemo(() => projects.find((project) => project.id === projectId), [projects, projectId]);
+  const selectedBlock = useMemo(() => blocks.find((block) => block.id === selectedBlockId) || blocks[0], [blocks, selectedBlockId]);
+  const issueCount = draft?.validation?.issues?.length || 0;
 
-  useEffect(() => {
-    api.projects().then(setProjects).catch((err) => setError(err.message));
-  }, []);
+  useEffect(() => { api.projects().then((items) => { setProjects(items); if (items[0]) setProjectId(items[0].id); }).catch(showError); }, []);
+  useEffect(() => { if (!projectId) return; setSelectedModel(null); setDraft(null); Promise.all([api.project(projectId), api.models(projectId)]).then(([project, projectModels]) => { setDocuments(project.documents); setModels(projectModels); if (!projectModels.length) setView("overview"); }).catch(showError); }, [projectId, job?.status]);
+  useEffect(() => { if (!job || ["completed", "failed"].includes(job.status)) return; const timer = window.setInterval(async () => { try { const latest = await api.job(job.id); setJob(latest); if (latest.status === "completed") { setNotice("文档解析完成，新的草稿方案已生成"); window.clearInterval(timer); } if (latest.status === "failed") { setError(latest.error_message || "解析任务失败"); window.clearInterval(timer); } } catch (err) { showError(err); } }, 1000); return () => window.clearInterval(timer); }, [job]);
+  function showError(err: unknown) { setError(err instanceof Error ? err.message : "请求失败，请稍后重试"); }
+  function selectProject(id: string) { setProjectId(id); setView("overview"); setNotice(""); setError(""); }
+  async function createProject() { if (!projectForm.name.trim()) return; setBusy(true); setError(""); try { const project = await api.createProject(projectForm); setProjects((current) => [project, ...current]); setProjectId(project.id); setProjectForm({ name: "", description: "" }); setNotice("项目已创建"); } catch (err) { showError(err); } finally { setBusy(false); } }
+  async function upload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; event.target.value = ""; if (!file || !projectId) return; setBusy(true); setError(""); setNotice(""); try { const result = await api.upload(projectId, file); setDocuments((current) => [result.document, ...current]); setJob(result.job); setView("overview"); setNotice("文件已上传，正在解析"); } catch (err) { showError(err); } finally { setBusy(false); } }
+  async function openModel(summary: ModelSummary, nextView: View = "model") { setBusy(true); setError(""); try { const model = await api.model(summary.id); setSelectedModel(model); setDraft(cloneSnapshot(model.model)); const sourceBlocks = await api.blocks(model.document_id); setBlocks(sourceBlocks); setSelectedBlockId(sourceBlocks[0]?.id || ""); setView(nextView); } catch (err) { showError(err); } finally { setBusy(false); } }
+  async function saveDraft() { if (!selectedModel || !draft || selectedModel.state !== "draft") return; setBusy(true); setError(""); try { const updated = await api.updateModel(selectedModel.id, selectedModel.version_no, draft); setSelectedModel(updated); setDraft(cloneSnapshot(updated.model)); setModels((current) => [updated, ...current.filter((item) => item.id !== selectedModel.id)]); setNotice(`已保存为草稿 v${updated.version_no}`); } catch (err) { showError(err); } finally { setBusy(false); } }
+  async function confirmModel() { if (!selectedModel) return; setBusy(true); try { const hasErrors = issueCount > 0; if (hasErrors && !window.confirm("当前方案有未解决的问题。确认后会保留这些问题，并生成已确认版本。继续吗？")) return; const confirmed = await api.confirm(selectedModel.id, hasErrors); setSelectedModel(confirmed); setDraft(cloneSnapshot(confirmed.model)); setModels((current) => [confirmed, ...current]); setNotice("方案已确认"); } catch (err) { showError(err); } finally { setBusy(false); } }
+  async function exportModel() { if (!selectedModel || selectedModel.state !== "confirmed") return; setBusy(true); try { const result = await api.export(selectedModel.id); setArtifacts(result.artifacts); setNotice(`已生成 ${result.artifacts.length} 个交付文件`); } catch (err) { showError(err); } finally { setBusy(false); } }
+  function updateModule(index: number, patch: Partial<ModuleItem>) { if (!draft) return; setDraft({ ...draft, modules: draft.modules.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) }); }
+  function updateParameter(index: number, patch: Partial<ParameterItem>) { if (!draft) return; setDraft({ ...draft, parameters: draft.parameters.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) }); }
+  function addModule() { if (!draft) return; const id = `B${String(draft.modules.length + 1).padStart(2, "0")}`; setDraft({ ...draft, modules: [...draft.modules, { id, name: "新模块", simulink_type: "Subsystem", inputs: [], outputs: [], description: "", origin: "user_input", evidence: [] }] }); }
+  function addParameter() { if (!draft) return; const id = `P${String(draft.parameters.length + 1).padStart(2, "0")}`; setDraft({ ...draft, parameters: [...draft.parameters, { id, owner_id: null, name: "新参数", value: null, unit: "", status: "needs_confirmation", origin: "user_input", evidence: [] }] }); }
 
-  useEffect(() => {
-    if (!projectId) return;
-    Promise.all([api.project(projectId), api.models(projectId)])
-      .then(([project, projectModels]) => {
-        setDocuments(project.documents);
-        setModels(projectModels);
-      })
-      .catch((err) => setError(err.message));
-  }, [projectId, job?.status]);
-
-  useEffect(() => {
-    if (!job || ["completed", "failed"].includes(job.status)) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const latest = await api.job(job.id);
-        setJob(latest);
-        if (latest.status === "completed") {
-          setNotice("文档解析和建模方案生成完成");
-          window.clearInterval(timer);
-        }
-        if (latest.status === "failed") {
-          setError(latest.error_message || "处理失败");
-          window.clearInterval(timer);
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "任务状态查询失败");
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [job]);
-
-  async function createProject() {
-    if (!projectForm.name.trim()) return;
-    setBusy(true);
-    setError("");
-    try {
-      const project = await api.createProject(projectForm);
-      setProjects((current) => [project, ...current]);
-      setProjectId(project.id);
-      setProjectForm({ name: "", description: "" });
-      setNotice("项目已创建");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "项目创建失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function upload(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file || !projectId) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.upload(projectId, file);
-      setDocuments((current) => [result.document, ...current]);
-      setJob(result.job);
-      setNotice("文件已上传，正在生成方案");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "上传失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function openModel(summary: ModelSummary) {
-    setError("");
-    try {
-      setSelectedModel(await api.model(summary.id));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "方案读取失败");
-    }
-  }
-
-  async function confirmModel() {
-    if (!selectedModel) return;
-    setBusy(true);
-    try {
-      const hasErrors = selectedModel.model.validation.issues.some((issue) => issue.severity === "error");
-      if (hasErrors && !window.confirm("当前方案仍有阻断问题，确认后将保留这些问题并进入已确认版本。是否继续？")) {
-        return;
-      }
-      const confirmed = await api.confirm(selectedModel.id, hasErrors);
-      setSelectedModel(confirmed);
-      setModels((current) => [confirmed, ...current]);
-      setNotice("方案已确认，可以导出");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "方案确认失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function exportModel() {
-    if (!selectedModel) return;
-    setBusy(true);
-    try {
-      const result = await api.export(selectedModel.id);
-      setNotice("方案包已生成");
-      const zip = result.artifacts.find((artifact) => artifact.filename.endsWith(".zip"));
-      if (zip) window.open(zip.download_url, "_blank", "noopener,noreferrer");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "导出失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">DOCUMENT-DRIVEN MODELING</p>
-          <h1>Simulink 建模助手</h1>
-        </div>
-        <div className="topbar-status"><span className="status-dot" />本地工作台</div>
-      </header>
-      <main className="workspace">
-        <aside className="sidebar">
-          <section className="panel project-panel">
-            <div className="panel-heading"><span>项目</span><span className="count">{projects.length}</span></div>
-            <div className="project-list">
-              {projects.map((project) => (
-                <button key={project.id} className={`project-item ${projectId === project.id ? "active" : ""}`} onClick={() => { setProjectId(project.id); setSelectedModel(null); }}>
-                  <strong>{project.name}</strong><span>{project.document_count} 份文档</span>
-                </button>
-              ))}
-              {!projects.length && <p className="empty-copy">创建第一个项目开始。</p>}
-            </div>
-          </section>
-          <section className="panel create-panel">
-            <div className="panel-heading"><span>新建项目</span></div>
-            <input value={projectForm.name} onChange={(event) => setProjectForm({ ...projectForm, name: event.target.value })} placeholder="项目名称" />
-            <textarea value={projectForm.description} onChange={(event) => setProjectForm({ ...projectForm, description: event.target.value })} placeholder="项目说明（可选）" rows={3} />
-            <button className="primary-button" disabled={busy || !projectForm.name.trim()} onClick={createProject}>创建项目</button>
-          </section>
-        </aside>
-
-        <section className="content">
-          {!selectedProject ? (
-            <div className="empty-state"><div className="empty-mark">∿</div><h2>从一份需求文档开始</h2><p>系统会提取控制目标、模块、参数和连接关系，生成可检查的 Simulink 建模方案。</p></div>
-          ) : (
-            <>
-              <div className="content-header">
-                <div><p className="eyebrow">PROJECT / {selectedProject.name}</p><h2>{selectedProject.name}</h2><p className="muted">上传 DOCX、PDF 或 Markdown，解析结果会保留原文证据。</p></div>
-                <label className={`upload-button ${busy ? "disabled" : ""}`}><span>＋</span>上传需求文档<input type="file" accept=".pdf,.docx,.md,.markdown,.txt" onChange={upload} disabled={busy} /></label>
-              </div>
-              {(notice || error) && <div className={`notice ${error ? "error" : ""}`}>{error || notice}</div>}
-              {job && <div className="job-card"><div><strong>解析任务</strong><span>{statusLabel[job.status] || job.status} · {job.stage}</span></div><div className="progress"><div style={{ width: `${job.progress}%` }} /></div><b>{job.progress}%</b></div>}
-              <div className="dashboard-grid">
-                <section className="panel data-panel"><div className="panel-heading"><span>文档</span><span className="count">{documents.length}</span></div>{documents.length ? documents.map((document) => <div className="document-row" key={document.id}><div className="file-icon">{document.extension.replace(".", "").toUpperCase()}</div><div><strong>{document.filename}</strong><span>{statusLabel[document.parse_status] || document.parse_status}</span></div></div>) : <p className="empty-copy">还没有上传文档。</p>}</section>
-                <section className="panel data-panel"><div className="panel-heading"><span>方案版本</span><span className="count">{models.length}</span></div>{models.length ? models.map((model) => <button className="model-row" key={model.id} onClick={() => openModel(model)}><div className="version">v{model.version_no}</div><div><strong>{model.system_name}</strong><span>{statusLabel[model.state] || model.state} · {statusLabel[model.buildability_status] || model.buildability_status}</span></div><span className="arrow">›</span></button>) : <p className="empty-copy">解析完成后会出现方案版本。</p>}</section>
-              </div>
-              {selectedModel && <ModelDetail model={selectedModel} busy={busy} onConfirm={confirmModel} onExport={exportModel} />}
-            </>
-          )}
-        </section>
-      </main>
-    </div>
-  );
+  return <div className="app-shell"><header className="topbar"><div className="brand"><span className="brand-mark">S</span><div><strong>Simulink 建模助手</strong><span>文档驱动建模工作台</span></div></div><div className="topbar-actions"><span className="server-state"><i />本地服务正常</span><button className="text-button" onClick={() => window.open("http://127.0.0.1:8000/docs", "_blank")}>API 文档</button></div></header><div className="shell-body"><aside className="sidebar"><div className="sidebar-section"><div className="sidebar-heading"><span>项目</span><span>{projects.length}</span></div><div className="project-list">{projects.map((project) => <button className={`project-item ${project.id === projectId ? "active" : ""}`} key={project.id} onClick={() => selectProject(project.id)}><span className="project-avatar">{project.name.slice(0, 1)}</span><span className="project-copy"><b>{project.name}</b><small>{project.document_count} 份文档</small></span></button>)}{!projects.length && <span className="side-empty">还没有项目</span>}</div></div><div className="sidebar-section create-project"><div className="sidebar-heading"><span>新建项目</span></div><input value={projectForm.name} onChange={(event) => setProjectForm({ ...projectForm, name: event.target.value })} placeholder="项目名称" /><textarea value={projectForm.description} onChange={(event) => setProjectForm({ ...projectForm, description: event.target.value })} placeholder="备注（可选）" rows={3} /><button className="solid-button full" disabled={busy || !projectForm.name.trim()} onClick={createProject}>创建项目</button></div></aside><main className="main-area">{!selectedProject ? <EmptyProject /> : <><div className="workspace-header"><div><div className="breadcrumb">项目 / {selectedProject.name}</div><h1>{selectedProject.name}</h1><p>{selectedProject.description || "未填写项目说明"}</p></div><label className={`solid-button upload-control ${busy ? "disabled" : ""}`}>上传文档<input type="file" accept=".pdf,.docx,.md,.markdown,.txt" onChange={upload} disabled={busy} /></label></div><nav className="view-tabs" aria-label="工作区视图">{viewItems.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => setView(item.id)}><b>{item.label}</b><small>{item.detail}</small>{item.id === "validation" && issueCount > 0 && <em>{issueCount}</em>}</button>)}</nav>{(notice || error) && <div className={`notice ${error ? "error" : ""}`}><span>{error ? "!" : "i"}</span>{error || notice}<button onClick={() => { setNotice(""); setError(""); }}>关闭</button></div>}{job && <JobBar job={job} />}{view === "overview" && <Overview documents={documents} models={models} selectedModel={selectedModel} onOpenModel={openModel} onUpload={() => document.querySelector<HTMLInputElement>(".upload-control input")?.click()} />}{view === "source" && <SourceView blocks={blocks} selectedBlock={selectedBlock} selectedBlockId={selectedBlockId} onSelect={setSelectedBlockId} model={draft} />}{view === "model" && <ModelView model={selectedModel} draft={draft} busy={busy} onOpenSource={(id) => { setSelectedBlockId(id); setView("source"); }} onDraftChange={setDraft} onModuleChange={updateModule} onParameterChange={updateParameter} onAddModule={addModule} onAddParameter={addParameter} onSave={saveDraft} onConfirm={confirmModel} onExport={exportModel} />}{view === "validation" && <ValidationView model={draft} blocks={blocks} />}{view === "export" && <ExportView model={selectedModel} artifacts={artifacts} busy={busy} onExport={exportModel} />}</>}</main></div></div>;
 }
 
-function ModelDetail({ model, busy, onConfirm, onExport }: { model: Model; busy: boolean; onConfirm: () => void; onExport: () => void }) {
-  const { modules, parameters, connections, validation, open_questions } = model.model;
-  return <section className="model-detail panel">
-    <div className="detail-header"><div><p className="eyebrow">MODEL VERSION / V{model.version_no}</p><h2>{model.model.system_name}</h2><div className="badges"><span className={`badge ${model.state === "confirmed" ? "success" : "warning"}`}>{statusLabel[model.state] || model.state}</span><span className="badge neutral">{statusLabel[model.buildability_status] || model.buildability_status}</span></div></div><div className="detail-actions"><button className="secondary-button" disabled={busy || model.state !== "draft"} onClick={onConfirm}>确认方案</button><button className="primary-button" disabled={busy || model.state !== "confirmed"} onClick={onExport}>导出方案包</button></div></div>
-    <div className="model-summary"><div><span>领域</span><strong>{model.model.domain}</strong></div><div><span>控制目标</span><strong>{model.model.control_objective || "待确认"}</strong></div><div><span>校验</span><strong>{validation.issues.length ? `${validation.issues.length} 项问题` : "通过"}</strong></div></div>
-    <ModelGraph model={model.model} />
-    {validation.issues.length > 0 && <div className="issues"><h3>校验与待确认项</h3>{validation.issues.map((issue, index) => <div className={`issue ${issue.severity}`} key={`${issue.code}-${index}`}><span>{issue.severity === "error" ? "!" : "i"}</span>{issue.message}</div>)}{open_questions.map((question, index) => <div className="issue warning" key={`question-${index}`}><span>?</span>{question.question}</div>)}</div>}
-    <div className="tables"><DataTable title="模块清单" headers={["编号", "模块", "Simulink 类型", "说明"]} rows={modules.map((item) => [item.id, item.name, item.simulink_type, item.description])} /><DataTable title="参数表" headers={["模块", "参数", "值", "单位", "状态"]} rows={parameters.map((item) => [item.owner_id || "-", item.name, item.value ?? "未提供", item.unit || "未知", item.status])} /><DataTable title="连线关系" headers={["起点", "终点", "信号", "含义"]} rows={connections.map((item) => [`${item.source_module}/${item.source_port}`, `${item.target_module}/${item.target_port}`, item.signal_name, item.meaning])} /></div>
-  </section>;
+function EmptyProject() { return <div className="empty-project"><div className="empty-project-line" /><h1>创建一个项目开始</h1><p>上传需求文档后，系统会将原文、模型结构和参数校验放在同一个工作区中。</p></div>; }
+function JobBar({ job }: { job: Job }) { return <div className="job-bar"><div><b>文档处理</b><span>{statusLabel[job.status] || job.status} · {job.stage}</span></div><div className="job-progress"><span style={{ width: `${job.progress}%` }} /></div><strong>{job.progress}%</strong></div>; }
+function SectionTitle({ title, action }: { title: string; action?: ReactNode }) { return <div className="section-title"><h2>{title}</h2>{action}</div>; }
+function Metric({ label, value, hint }: { label: string; value: string; hint: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>; }
+function WorkflowStep({ index, label, done }: { index: string; label: string; done: boolean }) { return <div className={`workflow-step ${done ? "done" : ""}`}><span>{done ? "✓" : index}</span><b>{label}</b></div>; }
+
+function Overview({ documents, models, selectedModel, onOpenModel, onUpload }: { documents: Document[]; models: ModelSummary[]; selectedModel: Model | null; onOpenModel: (model: ModelSummary) => void; onUpload: () => void }) {
+  const latest = models[0];
+  return <div className="view-content overview-view"><div className="metric-strip"><Metric label="需求文档" value={String(documents.length)} hint="已上传" /><Metric label="方案版本" value={String(models.length)} hint="含草稿和确认版" /><Metric label="当前问题" value={String(selectedModel?.model.validation.issues.length || 0)} hint="需要关注" /><Metric label="最新状态" value={statusLabel[latest?.state] || "未生成"} hint={latest?.system_name || "上传文档后生成"} /></div><div className="overview-grid"><section className="work-section"><SectionTitle title="文档" action={<button className="outline-button" onClick={onUpload}>上传新文档</button>} /><div className="document-list">{documents.map((document) => <div className="document-item" key={document.id}><div className="file-type">{document.extension.replace(".", "").toUpperCase()}</div><div className="document-main"><b>{document.filename}</b><span>{formatBytes(document.size_bytes)} · {new Date(document.created_at).toLocaleString()}</span></div><span className={`status-chip ${document.parse_status}`}>{statusLabel[document.parse_status] || document.parse_status}</span></div>)}{!documents.length && <div className="section-empty">上传一份 DOCX、PDF 或 Markdown 需求文档。</div>}</div></section><section className="work-section"><SectionTitle title="方案版本" action={latest ? <button className="outline-button" onClick={() => onOpenModel(latest)}>打开最新版本</button> : null} /><div className="version-list">{models.map((model) => <button className="version-item" key={model.id} onClick={() => onOpenModel(model)}><span className="version-number">v{model.version_no}</span><span><b>{model.system_name}</b><small>{statusLabel[model.state]} · {statusLabel[model.buildability_status] || model.buildability_status}</small></span><span className="chevron">›</span></button>)}{!models.length && <div className="section-empty">解析完成后，方案版本会出现在这里。</div>}</div></section></div><section className="work-section workflow-section"><SectionTitle title="工作流程" /><div className="workflow"><WorkflowStep index="01" label="上传文档" done={documents.length > 0} /><WorkflowStep index="02" label="解析并提取" done={documents.some((item) => item.parse_status === "completed")} /><WorkflowStep index="03" label="检查模型方案" done={Boolean(latest)} /><WorkflowStep index="04" label="确认并导出" done={models.some((item) => item.state === "confirmed")} /></div></section></div>;
 }
 
-function ModelGraph({ model }: { model: Model["model"] }) {
-  const { nodes, edges } = useMemo(() => {
-    const layout = new graphlib.Graph();
-    layout.setGraph({ rankdir: "LR", ranksep: 110, nodesep: 54, marginx: 40, marginy: 36 });
-    layout.setDefaultEdgeLabel(() => ({}));
-    for (const module of model.modules) layout.setNode(module.id, { width: 196, height: 92 });
-    for (const connection of model.connections) {
-      if (layout.hasNode(connection.source_module) && layout.hasNode(connection.target_module)) {
-        layout.setEdge(connection.source_module, connection.target_module);
-      }
-    }
-    dagreLayout(layout);
-    const nodes: BlockNodeType[] = model.modules.map((module) => {
-      const point = layout.node(module.id) || { x: 100, y: 100 };
-      return {
-        id: module.id,
-        type: "simulinkBlock",
-        position: { x: point.x - 98, y: point.y - 46 },
-        sourcePosition: Position.Right,
-        targetPosition: Position.Left,
-        data: { id: module.id, name: module.name, kind: module.simulink_type, description: module.description },
-      };
-    });
-    const edges: Edge[] = model.connections
-      .filter((connection) => model.modules.some((module) => module.id === connection.source_module) && model.modules.some((module) => module.id === connection.target_module))
-      .map((connection, index) => ({
-        id: `edge-${index}`,
-        source: connection.source_module,
-        target: connection.target_module,
-        label: connection.signal_name,
-        type: "smoothstep",
-        markerEnd: { type: MarkerType.ArrowClosed, color: "#54708f" },
-        style: { stroke: "#54708f", strokeWidth: 1.8 },
-        labelStyle: { fill: "#60748d", fontSize: 11 },
-        labelBgStyle: { fill: "#fff", fillOpacity: 0.92 },
-      }));
-    return { nodes, edges };
-  }, [model]);
+function SourceView({ blocks, selectedBlock, selectedBlockId, onSelect, model }: { blocks: SourceBlock[]; selectedBlock?: SourceBlock; selectedBlockId: string; onSelect: (id: string) => void; model: Snapshot | null }) {
+  return <div className="view-content source-view"><div className="source-layout"><aside className="source-index"><div className="subheading"><b>来源块</b><span>{blocks.length}</span></div>{blocks.map((block) => <button className={block.id === selectedBlockId ? "active" : ""} key={block.id} onClick={() => onSelect(block.id)}><span>{block.type}</span><b>{block.text.replace(/\s+/g, " ").slice(0, 72)}</b><small>{formatLocator(block.locator)}</small></button>)}{!blocks.length && <div className="section-empty">打开一个方案版本后显示解析证据。</div>}</aside><section className="source-reader">{selectedBlock ? <><div className="reader-meta"><span>{selectedBlock.type}</span><b>{formatLocator(selectedBlock.locator)}</b><small>置信度 {selectedBlock.confidence === null ? "未知" : `${Math.round(selectedBlock.confidence * 100)}%`}</small></div><pre>{selectedBlock.text}</pre><div className="reader-links"><b>被以下内容引用</b><EvidenceReferences model={model} blockId={selectedBlock.id} /></div></> : <div className="section-empty">选择左侧来源块查看原文。</div>}</section></div></div>;
+}
+function EvidenceReferences({ model, blockId }: { model: Snapshot | null; blockId: string }) { if (!model) return <span className="muted">尚未打开模型</span>; const references = [...model.modules.filter((item) => item.evidence.includes(blockId)).map((item) => `模块 ${item.id} ${item.name}`), ...model.parameters.filter((item) => item.evidence.includes(blockId)).map((item) => `参数 ${item.name}`), ...model.connections.filter((item) => item.evidence.includes(blockId)).map((item) => `连线 ${item.signal_name || "未命名信号"}`)]; return references.length ? <div className="reference-list">{references.map((item) => <span key={item}>{item}</span>)}</div> : <span className="muted">没有模型字段引用该来源块</span>; }
 
-  return <section className="graph-section">
-    <div className="table-heading"><h3>Simulink 结构图</h3><span>从左向右 · 可缩放和拖动画布</span></div>
-    <div className="graph-canvas">
-      {nodes.length ? <ReactFlow nodes={nodes} edges={edges} nodeTypes={graphNodeTypes} fitView fitViewOptions={{ padding: 0.16 }} nodesDraggable={false} nodesConnectable={false} elementsSelectable proOptions={{ hideAttribution: true }}>
-        <Background color="#dfe6ef" gap={18} size={1} />
-        <Controls showInteractive={false} />
-      </ReactFlow> : <p className="empty-copy">尚未识别出模块。</p>}
-    </div>
-  </section>;
+function ModelView({ model, draft, busy, onOpenSource, onDraftChange, onModuleChange, onParameterChange, onAddModule, onAddParameter, onSave, onConfirm, onExport }: { model: Model | null; draft: Snapshot | null; busy: boolean; onOpenSource: (id: string) => void; onDraftChange: (model: Snapshot) => void; onModuleChange: (index: number, patch: Partial<ModuleItem>) => void; onParameterChange: (index: number, patch: Partial<ParameterItem>) => void; onAddModule: () => void; onAddParameter: () => void; onSave: () => void; onConfirm: () => void; onExport: () => void }) {
+  if (!model || !draft) return <div className="view-content"><div className="section-empty large">先在项目概览中打开一个方案版本。</div></div>;
+  return <div className="view-content model-view"><div className="model-toolbar"><div><span className={`state-label ${model.state}`}>{statusLabel[model.state]}</span><span className="model-version">v{model.version_no}</span><span className="model-updated">{draft.extraction_source === "llm" ? "LLM 抽取" : "规则回退"}</span></div><div className="toolbar-actions"><button className="outline-button" disabled={busy || model.state !== "draft"} onClick={onSave}>保存草稿</button><button className="outline-button" disabled={busy || model.state !== "draft"} onClick={onConfirm}>确认方案</button><button className="solid-button" disabled={busy || model.state !== "confirmed"} onClick={onExport}>导出方案</button></div></div><div className="model-layout"><div className="model-editor"><section className="work-section"><SectionTitle title="基本信息" /><div className="form-grid"><label>系统名称<input value={draft.system_name} disabled={model.state !== "draft"} onChange={(event) => onDraftChange({ ...draft, system_name: event.target.value })} /></label><label>系统领域<select value={draft.domain} disabled={model.state !== "draft"} onChange={(event) => onDraftChange({ ...draft, domain: event.target.value })}>{domainOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><label className="wide">控制目标<textarea value={draft.control_objective} disabled={model.state !== "draft"} onChange={(event) => onDraftChange({ ...draft, control_objective: event.target.value })} rows={2} /></label></div></section><section className="work-section"><SectionTitle title="模块清单" action={<button className="outline-button" disabled={model.state !== "draft"} onClick={onAddModule}>添加模块</button>} /><EditableModules modules={draft.modules} disabled={model.state !== "draft"} onChange={onModuleChange} onOpenSource={onOpenSource} /></section><section className="work-section"><SectionTitle title="参数表" action={<button className="outline-button" disabled={model.state !== "draft"} onClick={onAddParameter}>添加参数</button>} /><EditableParameters parameters={draft.parameters} modules={draft.modules} disabled={model.state !== "draft"} onChange={onParameterChange} onOpenSource={onOpenSource} /></section><section className="work-section"><SectionTitle title="连线关系" /><ConnectionTable connections={draft.connections} onOpenSource={onOpenSource} /></section></div><aside className="model-aside"><ModelGraph model={draft} /><SimulationConfig config={draft.simulation_config || {}} /></aside></div></div>;
 }
 
-function DataTable({ title, headers, rows }: { title: string; headers: string[]; rows: Array<Array<string | number | null>> }) {
-  return <div className="table-block"><div className="table-heading"><h3>{title}</h3><span>{rows.length} 项</span></div>{rows.length ? <div className="table-scroll"><table><thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell ?? "-"}</td>)}</tr>)}</tbody></table></div> : <p className="empty-copy">暂无数据。</p>}</div>;
-}
+function EditableModules({ modules, disabled, onChange, onOpenSource }: { modules: ModuleItem[]; disabled: boolean; onChange: (index: number, patch: Partial<ModuleItem>) => void; onOpenSource: (id: string) => void }) { return <div className="editable-table"><div className="table-head module-grid"><span>编号</span><span>模块名称</span><span>Simulink 类型</span><span>说明</span><span>来源</span></div>{modules.map((item, index) => <div className="table-row module-grid" key={item.id}><b>{item.id}</b><input disabled={disabled} value={item.name} onChange={(event) => onChange(index, { name: event.target.value })} /><input disabled={disabled} value={item.simulink_type} onChange={(event) => onChange(index, { simulink_type: event.target.value })} /><input disabled={disabled} value={item.description} onChange={(event) => onChange(index, { description: event.target.value })} />{item.evidence.length ? <button className="evidence-button" onClick={() => onOpenSource(item.evidence[0])}>{item.evidence.length} 条证据</button> : <span className="no-evidence">无证据</span>}</div>)}</div>; }
+function EditableParameters({ parameters, modules, disabled, onChange, onOpenSource }: { parameters: ParameterItem[]; modules: ModuleItem[]; disabled: boolean; onChange: (index: number, patch: Partial<ParameterItem>) => void; onOpenSource: (id: string) => void }) { return <div className="editable-table"><div className="table-head parameter-grid"><span>参数</span><span>所属模块</span><span>值</span><span>单位</span><span>状态</span><span>来源</span></div>{parameters.map((item, index) => <div className="table-row parameter-grid" key={item.id}><input disabled={disabled} value={item.name} onChange={(event) => onChange(index, { name: event.target.value })} /><select disabled={disabled} value={item.owner_id || ""} onChange={(event) => onChange(index, { owner_id: event.target.value || null })}><option value="">未指定</option>{modules.map((module) => <option value={module.id} key={module.id}>{module.id} {module.name}</option>)}</select><input disabled={disabled} value={item.value ?? ""} onChange={(event) => onChange(index, { value: event.target.value })} /><input disabled={disabled} value={item.unit} onChange={(event) => onChange(index, { unit: event.target.value })} /><select disabled={disabled} value={item.status} onChange={(event) => onChange(index, { status: event.target.value as ParameterItem["status"] })}>{parameterStatuses.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>{item.evidence.length ? <button className="evidence-button" onClick={() => onOpenSource(item.evidence[0])}>{item.evidence.length} 条证据</button> : <span className="no-evidence">无证据</span>}</div>)}</div>; }
+function ConnectionTable({ connections, onOpenSource }: { connections: Snapshot["connections"]; onOpenSource: (id: string) => void }) { return <div className="editable-table"><div className="table-head connection-grid"><span>起点</span><span>终点</span><span>信号</span><span>含义</span><span>来源</span></div>{connections.map((item, index) => <div className="table-row connection-grid" key={`${item.source_module}-${item.target_module}-${index}`}><span>{item.source_module} / {item.source_port}</span><span>{item.target_module} / {item.target_port}</span><span>{item.signal_name || "未命名"}</span><span>{item.meaning || "未填写"}</span>{item.evidence.length ? <button className="evidence-button" onClick={() => onOpenSource(item.evidence[0])}>{item.evidence.length} 条证据</button> : <span className="no-evidence">无证据</span>}</div>)}</div>; }
+function SimulationConfig({ config }: { config: Record<string, unknown> }) { return <section className="work-section simulation-config"><SectionTitle title="仿真配置建议" /><div className="config-list">{Object.entries(config).map(([key, value]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><b>{value === null || value === "" ? "待确认" : String(value)}</b></div>)}</div></section>; }
+
+function ValidationView({ model, blocks }: { model: Snapshot | null; blocks: SourceBlock[] }) { if (!model) return <div className="view-content"><div className="section-empty large">先打开一个方案版本查看校验结果。</div></div>; return <div className="view-content validation-view"><div className="validation-summary"><div className={`validation-state ${model.validation.status === "passed" ? "passed" : "review"}`}><strong>{model.validation.status === "passed" ? "校验通过" : "需要复核"}</strong><span>{model.validation.issues.length} 个问题 · {model.open_questions.length} 个待确认项</span></div><div><span>可搭建状态</span><b>{statusLabel[model.buildability_status] || model.buildability_status}</b></div><div><span>来源块</span><b>{blocks.length}</b></div></div><div className="validation-columns"><section className="work-section"><SectionTitle title="校验问题" />{model.validation.issues.length ? model.validation.issues.map((issue, index) => <div className={`validation-row ${issue.severity}`} key={`${issue.code}-${index}`}><span className="severity-dot" /><div><b>{issue.message}</b><small>{issue.code}</small></div></div>) : <div className="section-empty">当前没有校验问题。</div>}</section><section className="work-section"><SectionTitle title="待确认项" />{model.open_questions.length ? model.open_questions.map((item, index) => <div className="question-row" key={`${item.question}-${index}`}><span>?</span><div><b>{item.question}</b><small>{item.severity === "blocking" ? "阻断项" : "建议确认"}</small></div></div>) : <div className="section-empty">没有待确认项。</div>}</section></div><section className="work-section"><SectionTitle title="系统假设" />{model.assumptions?.length ? <div className="assumption-list">{model.assumptions.map((item, index) => <div key={index}><b>{String(item.text || item.assumption || "未命名假设")}</b><small>{item.evidence ? `证据：${(item.evidence as string[]).join(", ")}` : "未关联证据"}</small></div>)}</div> : <div className="section-empty">没有记录系统假设。</div>}</section></div>; }
+function ExportView({ model, artifacts, busy, onExport }: { model: Model | null; artifacts: Artifact[]; busy: boolean; onExport: () => void }) { return <div className="view-content export-view"><section className="work-section export-intro"><div><p className="eyebrow">交付方案包</p><h2>{model ? model.model.system_name : "尚未选择方案"}</h2><p>导出内容基于已确认版本，包含结构图、模块清单、参数表、连线关系和需求解析结果。</p></div><button className="solid-button" disabled={busy || !model || model.state !== "confirmed"} onClick={onExport}>生成方案包</button></section><div className="export-files"><ExportFile name="Simulink模型结构图.svg" detail="模型结构图，可在浏览器中查看" artifacts={artifacts} /><ExportFile name="模块清单.csv" detail="模块、类型、输入输出和说明" artifacts={artifacts} /><ExportFile name="模块参数表.csv" detail="参数值、单位、状态和来源" artifacts={artifacts} /><ExportFile name="连线关系表.csv" detail="端口、信号名称和信号含义" artifacts={artifacts} /><ExportFile name="需求解析结果.md" detail="需求、假设、校验和待确认项" artifacts={artifacts} /><ExportFile name="model.json" detail="完整规范模型快照" artifacts={artifacts} /></div>{model?.state !== "confirmed" && <div className="export-hint">确认方案后才能生成交付文件。当前版本：{statusLabel[model?.state || ""] || "未选择"}</div>}</div>; }
+function ExportFile({ name, detail, artifacts }: { name: string; detail: string; artifacts: Artifact[] }) { const artifact = artifacts.find((item) => item.filename === name); return <div className="export-file"><span className="file-type">{name.split(".").pop()?.toUpperCase()}</span><div><b>{name}</b><small>{detail}</small></div>{artifact ? <a className="file-ready link" href={artifact.download_url} target="_blank" rel="noreferrer">下载</a> : <span className="file-ready">待生成</span>}</div>; }
+
+function ModelGraph({ model }: { model: Snapshot }) { const { nodes, edges } = useMemo(() => { const layout = new graphlib.Graph(); layout.setGraph({ rankdir: "LR", ranksep: 90, nodesep: 42, marginx: 30, marginy: 30 }); layout.setDefaultEdgeLabel(() => ({})); for (const module of model.modules) layout.setNode(module.id, { width: 176, height: 82 }); for (const connection of model.connections) if (layout.hasNode(connection.source_module) && layout.hasNode(connection.target_module)) layout.setEdge(connection.source_module, connection.target_module); dagreLayout(layout); const nodes: Node<BlockNodeData, "simulinkBlock">[] = model.modules.map((module) => { const point = layout.node(module.id) || { x: 100, y: 100 }; return { id: module.id, type: "simulinkBlock", position: { x: point.x - 88, y: point.y - 41 }, sourcePosition: Position.Right, targetPosition: Position.Left, data: { id: module.id, name: module.name, kind: module.simulink_type, description: module.description } }; }); const edges: Edge[] = model.connections.filter((connection) => model.modules.some((module) => module.id === connection.source_module) && model.modules.some((module) => module.id === connection.target_module)).map((connection, index) => ({ id: `edge-${index}`, source: connection.source_module, target: connection.target_module, label: connection.signal_name, type: "smoothstep", markerEnd: { type: MarkerType.ArrowClosed, color: "#52687f" }, style: { stroke: "#52687f", strokeWidth: 1.6 }, labelStyle: { fill: "#52687f", fontSize: 10 }, labelBgStyle: { fill: "#fff", fillOpacity: 0.9 } })); return { nodes, edges }; }, [model]); return <section className="graph-panel"><div className="panel-label"><b>结构预览</b><span>{model.modules.length} 个模块 · {model.connections.length} 条连线</span></div><div className="graph-canvas">{nodes.length ? <ReactFlow nodes={nodes} edges={edges} nodeTypes={graphNodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}><Background color="#e4e9ee" gap={18} size={1} /><Controls showInteractive={false} /></ReactFlow> : <div className="section-empty">没有模块可预览。</div>}</div></section>; }
 
 export default App;
