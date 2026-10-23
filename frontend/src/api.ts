@@ -6,6 +6,8 @@ export type Project = {
   document_count: number;
 };
 
+export type LLMModels = { models: Array<{ id: string; name: string }>; selected_model: string };
+
 export type Document = {
   id: string;
   project_id?: string;
@@ -15,6 +17,8 @@ export type Document = {
   size_bytes: number;
   sha256?: string;
   parse_status: string;
+  markdown_available?: boolean;
+  markdown_download_url?: string | null;
   created_at: string;
 };
 
@@ -40,6 +44,7 @@ export type Job = {
   status: string;
   stage: string;
   progress: number;
+  updated_at?: string;
   error_message?: string | null;
 };
 
@@ -85,6 +90,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  llmModels: () => request<LLMModels>("/api/v1/llm/models"),
+  selectLlmModel: (model: string) => request<{ selected_model: string }>("/api/v1/llm/model", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model }) }),
   projects: () => request<Project[]>("/api/v1/projects"),
   createProject: (payload: { name: string; description: string }) =>
     request<Project>("/api/v1/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),

@@ -8,6 +8,7 @@ from app.models import Document, Job, ModelVersion, ParseRun, SourceBlock
 from app.schemas import ModelSnapshot
 from app.services.extraction import extract_model
 from app.services.parsing import ParserError, parse_document
+from app.services.storage import save_document_markdown
 from app.services.validation import validate_model
 
 
@@ -39,6 +40,8 @@ async def run_document_pipeline(job_id: str) -> None:
         db.commit()
         _set_job(db, job, status="running", stage="parsing", progress=10)
         result = parse_document(document.storage_key, document.extension)
+        if result.markdown_content:
+            save_document_markdown(document.id, document.filename, result.markdown_content)
 
         parse_run = ParseRun(
             document_id=document.id,

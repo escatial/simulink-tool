@@ -7,8 +7,17 @@ BLOCKING_STATUSES = {"missing", "unit_unknown", "multiple_candidates", "needs_co
 def validate_model(model: ModelSnapshot, source_ids: set[str]) -> dict:
     issues: list[dict] = []
     module_ids = {module.id for module in model.modules}
-    for item in [*model.modules, *model.parameters, *model.connections]:
-        for evidence in item.evidence:
+    evidence_items = [
+        *model.modules,
+        *model.parameters,
+        *model.connections,
+        *model.equations,
+        *model.input_signals,
+        *model.output_signals,
+    ]
+    for item in evidence_items:
+        evidence_values = item.get("evidence", []) if isinstance(item, dict) else item.evidence
+        for evidence in evidence_values:
             if evidence not in source_ids:
                 issues.append({"code": "invalid_evidence", "severity": "error", "message": f"证据不存在：{evidence}"})
 

@@ -1,8 +1,10 @@
 from pathlib import Path
+from datetime import timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -12,7 +14,15 @@ from app.models import Artifact, Document, Job, ModelVersion, ParseRun, Project,
 from app.schemas import ConfirmRequest, ExportRequest, ModelEdit, ModelSnapshot, ParseRequest, ProjectCreate
 from app.services.dispatcher import dispatch_parse_job
 from app.services.exporter import build_artifacts, build_zip
-from app.services.storage import FileValidationError, save_artifact, save_upload
+from app.services.llm import LLMUnavailable, fetch_upstream_models
+from app.services.storage import (
+    FileValidationError,
+    document_markdown_path,
+    get_selected_llm_model,
+    save_artifact,
+    save_selected_llm_model,
+    save_upload,
+)
 from app.services.validation import validate_model
 
 
@@ -28,6 +38,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LLMModelSelection(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
 
 
 def project_or_404(db: Session, project_id: str) -> Project:
@@ -47,6 +61,27 @@ def model_or_404(db: Session, model_id: str) -> ModelVersion:
 @app.get("/api/v1/health")
 def health() -> dict:
     return {"status": "ok", "service": settings.app_name, "version": app.version}
+
+
+@app.get("/api/v1/llm/models")
+async def list_llm_models() -> dict:
+    try:
+        models = await fetch_upstream_models()
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"models": models, "selected_model": get_selected_llm_model(settings.llm_model)}
+
+
+@app.put("/api/v1/llm/model")
+async def select_llm_model(payload: LLMModelSelection) -> dict:
+    try:
+        models = await fetch_upstream_models()
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if payload.model not in {item["id"] for item in models}:
+        raise HTTPException(status_code=400, detail="所选模型不在 MiniMax 上游模型列表中")
+    save_selected_llm_model(payload.model)
+    return {"selected_model": payload.model}
 
 
 @app.get("/api/v1/projects")
@@ -177,6 +212,19 @@ def list_source_blocks(document_id: str, db: Session = Depends(get_db)) -> list[
     return [{"id": block.block_key, "type": block.block_type, "text": block.text, "locator": block.locator, "confidence": block.confidence} for block in blocks]
 
 
+@app.get("/api/v1/documents/{document_id}/markdown")
+def download_document_markdown(document_id: str, db: Session = Depends(get_db)) -> FileResponse:
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if document.extension != ".pdf":
+        raise HTTPException(status_code=409, detail="只有 PDF 文档提供 PDF 转 Markdown 下载")
+    path = document_markdown_path(document.id, document.filename)
+    if not path.is_file():
+        raise HTTPException(status_code=409, detail="Markdown 尚未生成，请等待文档解析完成后重试")
+    return FileResponse(path, filename=f"{Path(document.filename).stem}.md", media_type="text/markdown; charset=utf-8")
+
+
 @app.get("/api/v1/projects/{project_id}/models")
 def list_models(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
     project_or_404(db, project_id)
@@ -292,6 +340,7 @@ def download_artifact(artifact_id: str, db: Session = Depends(get_db)) -> FileRe
 
 
 def document_to_dict(document: Document) -> dict:
+    markdown_available = document.extension == ".pdf" and document_markdown_path(document.id, document.filename).is_file()
     return {
         "id": document.id,
         "project_id": document.project_id,
@@ -301,11 +350,16 @@ def document_to_dict(document: Document) -> dict:
         "size_bytes": document.size_bytes,
         "sha256": document.sha256,
         "parse_status": document.parse_status,
+        "markdown_available": markdown_available,
+        "markdown_download_url": f"/api/v1/documents/{document.id}/markdown" if markdown_available else None,
         "created_at": document.created_at.isoformat(),
     }
 
 
 def job_to_dict(job: Job) -> dict:
+    updated_at = job.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -317,7 +371,7 @@ def job_to_dict(job: Job) -> dict:
         "error_code": job.error_code,
         "error_message": job.error_message,
         "created_at": job.created_at.isoformat(),
-        "updated_at": job.updated_at.isoformat(),
+        "updated_at": updated_at.isoformat(),
     }
 
 

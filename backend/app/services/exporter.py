@@ -90,6 +90,14 @@ def _markdown(model: ModelSnapshot) -> str:
     lines = [f"# {model.system_name}", "", f"- 领域：{model.domain}", f"- 控制目标：{model.control_objective}", f"- 模型状态：{model.buildability_status}", "", "## 模块清单", ""]
     for module in model.modules:
         lines.append(f"- **{module.id} {module.name}**：`{module.simulink_type}`；{module.description}")
+    lines += ["", "## 方程", ""]
+    if model.equations:
+        lines += ["| 编号 | 表达式 | 状态 | 证据 |", "|---|---|---|---|"]
+        for equation in model.equations:
+            evidence = ", ".join(equation.get("evidence", []))
+            lines.append(f"| {equation.get('id', '')} | `{equation.get('expression', '')}` | {equation.get('status', '待确认')} | {evidence} |")
+    else:
+        lines.append("未识别到方程。")
     lines += ["", "## 参数", "", "| 模块 | 参数 | 值 | 单位 | 状态 |", "|---|---|---|---|---|"]
     for parameter in model.parameters:
         value = parameter.value if parameter.value is not None else "未提供"

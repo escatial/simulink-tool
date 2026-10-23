@@ -59,3 +59,31 @@ def save_artifact(model_id: str, filename: str, content: bytes) -> tuple[str, st
     target = target_dir / f"{uuid4()}_{safe_filename(filename)}"
     target.write_bytes(content)
     return str(target), hashlib.sha256(content).hexdigest()
+
+
+def save_document_markdown(document_id: str, filename: str, content: str) -> str:
+    target_dir = storage_root() / "markdown" / document_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{safe_filename(Path(filename).stem)}.md"
+    target.write_text(content, encoding="utf-8")
+    return str(target)
+
+
+def document_markdown_path(document_id: str, filename: str) -> Path:
+    return storage_root() / "markdown" / document_id / f"{safe_filename(Path(filename).stem)}.md"
+
+
+def selected_llm_model_path() -> Path:
+    return storage_root() / "llm_model.txt"
+
+
+def get_selected_llm_model(default: str) -> str:
+    path = selected_llm_model_path()
+    if not path.is_file():
+        return default
+    selected = path.read_text(encoding="utf-8").strip()
+    return selected or default
+
+
+def save_selected_llm_model(model: str) -> None:
+    selected_llm_model_path().write_text(model.strip(), encoding="utf-8")

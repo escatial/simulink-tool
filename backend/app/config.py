@@ -15,11 +15,11 @@ class Settings(BaseSettings):
     mineru_timeout_seconds: int = 600
     mineru_pdf_tier: str = "basic"
     mineru_required: bool = False
-    llm_enabled: bool = False
-    llm_base_url: str = "https://api.openai.com/v1"
+    llm_enabled: bool = True
+    llm_base_url: str = "https://api.minimaxi.com/v1"
     llm_api_key: str = ""
-    llm_model: str = ""
-    llm_timeout_seconds: int = 90
+    llm_model: str = "MiniMax-M3.1-Flash"
+    llm_timeout_seconds: int = 480
     allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

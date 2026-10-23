@@ -45,14 +45,18 @@ DOCX、PDF 解析会把解析器版本、警告、来源块和置信度保存到
 
 ## LLM 配置
 
+项目默认使用 MiniMax OpenAI 兼容接口，默认模型为 `MiniMax-M3.1-Flash`。本地密钥写入 `backend/.env`，不要提交该文件。前端侧栏的“模型服务”区域可点击“从上游获取”刷新模型列表并切换模型；模型选择保存在本地 `storage/llm_model.txt`。
+
 ```dotenv
 LLM_ENABLED=true
-LLM_BASE_URL=https://api.openai.com/v1
+LLM_BASE_URL=https://api.minimaxi.com/v1
 LLM_API_KEY=your-key
-LLM_MODEL=your-model
+LLM_MODEL=MiniMax-M3.1-Flash
 ```
 
-LLM 只负责候选需求结构化，不直接生成最终图形；服务端会验证 JSON Schema、证据 ID、参数状态和连接关系。未配置 LLM 时，电机控制文档仍可通过本地规则生成演示方案，并明确标注需要人工复核。
+上游模型列表由后端通过 `GET {LLM_BASE_URL}/models` 获取。选择模型使用 `PUT /api/v1/llm/model`，请求体为 `{"model":"模型ID"}`；后端会校验该 ID 存在于上游列表中。
+
+LLM 负责从论文证据中生成候选数学模型和仿真方案，不直接生成最终图形；服务端会验证 JSON Schema、证据 ID、参数状态和连接关系。未配置 LLM 时，系统仅使用通用证据抽取回退，不套用固定领域或电机参数模板，并明确标注需要人工复核。
 
 ## 生产任务队列
 

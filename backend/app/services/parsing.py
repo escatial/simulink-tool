@@ -26,6 +26,7 @@ class ParseResult:
     parser_version: str
     blocks: list[SourceBlockData]
     warnings: list[str] = field(default_factory=list)
+    markdown_content: str = ""
 
 
 class ParserError(RuntimeError):
@@ -122,6 +123,10 @@ def _pdf_text(path: Path) -> tuple[str, list[SourceBlockData]]:
     return "\n\n".join(block.text for block in blocks), blocks
 
 
+def _pdf_markdown(blocks: list[SourceBlockData]) -> str:
+    return "\n\n".join(f"## 第 {block.locator['page_number']} 页\n\n{block.text}" for block in blocks) + ("\n" if blocks else "")
+
+
 def _mineru_parse(path: Path) -> ParseResult:
     settings = get_settings()
     output_dir = Path(tempfile.mkdtemp(prefix="mineru-"))
@@ -157,10 +162,11 @@ def _mineru_parse(path: Path) -> ParseResult:
                 markdown.write_text(content or json.dumps(data, ensure_ascii=False), encoding="utf-8")
             else:
                 raise ParserError("MinerU 未产生 Markdown 或 JSON 结果")
-        blocks = _markdown_blocks(markdown.read_text(encoding="utf-8"))
+        markdown_content = markdown.read_text(encoding="utf-8")
+        blocks = _markdown_blocks(markdown_content)
         for block in blocks:
             block.locator["parser"] = "mineru"
-        return ParseResult("mineru", "configured", blocks)
+        return ParseResult("mineru", "configured", blocks, markdown_content=markdown_content)
     except FileNotFoundError as exc:
         raise ParserError(f"找不到 MinerU 命令：{settings.mineru_command}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -185,13 +191,16 @@ def parse_document(path: str, extension: str) -> ParseResult:
             mineru_warning.append(f"MinerU 未完成解析，已尝试本地回退：{exc}")
 
     if extension in {".md", ".markdown", ".txt"}:
-        return ParseResult("markdown-local", "1.0", _markdown_blocks(source.read_text(encoding="utf-8")))
+        content = source.read_text(encoding="utf-8")
+        return ParseResult("markdown-local", "1.0", _markdown_blocks(content), markdown_content=content)
     if extension == ".docx":
-        return ParseResult("docx-local", "1.0", _markdown_blocks(_docx_text(source)), mineru_warning)
+        content = _docx_text(source)
+        markdown_content = "\n\n".join(content.splitlines()) + ("\n" if content else "")
+        return ParseResult("docx-local", "1.0", _markdown_blocks(content), mineru_warning, markdown_content)
     if extension == ".pdf":
         _, blocks = _pdf_text(source)
         warnings = mineru_warning + ["PDF 使用本地文本提取；扫描页、公式和复杂表格可能需要 MinerU。"]
         if not blocks:
             warnings.append("未提取到文本，建议配置 MinerU OCR 或上传文本型 PDF。")
-        return ParseResult("pdf-local", "1.0", blocks, warnings)
+        return ParseResult("pdf-local", "1.0", blocks, warnings, _pdf_markdown(blocks))
     raise ParserError(f"暂不支持的文件格式：{extension}")
